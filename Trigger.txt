@@ -1,0 +1,134 @@
+ALTER TABLE [dbo].[product]
+ALTER COLUMN [cost] DECIMAL(10,2) NULL;
+
+ALTER TABLE invoices
+ADD CONSTRAINT DF_invoices_profit DEFAULT 0 FOR profit;
+
+-- Cập nhật tự động tính toán chi phí sản phẩm
+CREATE TRIGGER trg_CalculateCost
+ON product
+AFTER INSERT
+AS
+BEGIN
+    UPDATE product
+    SET cost = inserted.price * 0.4
+    FROM product
+    INNER JOIN inserted ON product.product_id = inserted.product_id;
+END;
+
+-- Cập nhật tự động tính toán chi phí sản phẩm sau khi update giá
+CREATE TRIGGER trg_CalculateCostBeforeUpdate
+ON product
+AFTER UPDATE
+AS
+BEGIN
+    IF UPDATE(price)
+    BEGIN
+        UPDATE product
+        SET cost = inserted.price * 0.4
+        FROM product
+        INNER JOIN inserted ON product.product_id = inserted.product_id
+        INNER JOIN deleted ON product.product_id = deleted.product_id
+        WHERE inserted.price <> deleted.price;
+    END
+END;
+
+--Hoàn lại số lượng
+CREATE TRIGGER trg_UpdateStock
+ON order_details
+AFTER INSERT
+AS
+BEGIN
+    -- Cập nhật số lượng tồn kho trong bảng 'product'
+    UPDATE p
+    SET p.stock = p.stock - i.quantity
+    FROM product p
+    INNER JOIN inserted i ON p.product_id = i.product_id;
+END;
+GO
+
+--Hoàn lại số lượng khi status đơn hàng canceled
+CREATE TRIGGER trg_RestoreStockOnCancel
+ON orders
+AFTER UPDATE
+AS
+BEGIN
+    -- Kiểm tra xem trường 'status' có được cập nhật thành 0 hay không
+    IF UPDATE(status)
+    BEGIN
+        -- Lặp qua tất cả các đơn hàng có trạng thái được cập nhật thành 0
+        DECLARE @order_id INT, @product_id INT, @quantity INT;
+        DECLARE cursor_order CURSOR FOR
+            SELECT order_id FROM inserted WHERE status = 0;
+
+        OPEN cursor_order;
+        FETCH NEXT FROM cursor_order INTO @order_id;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            -- Lặp qua tất cả các sản phẩm trong đơn hàng bị hủy
+            DECLARE cursor_restore CURSOR FOR
+                SELECT product_id, quantity FROM order_details WHERE order_id = @order_id;
+
+            OPEN cursor_restore;
+            FETCH NEXT FROM cursor_restore INTO @product_id, @quantity;
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                -- Hoàn lại số lượng sản phẩm vào bảng 'product'
+                UPDATE product
+                SET stock = stock + @quantity
+                WHERE product_id = @product_id;
+
+                FETCH NEXT FROM cursor_restore INTO @product_id, @quantity;
+            END;
+
+            CLOSE cursor_restore;
+            DEALLOCATE cursor_restore;
+
+            FETCH NEXT FROM cursor_order INTO @order_id;
+        END;
+
+        CLOSE cursor_order;
+        DEALLOCATE cursor_order;
+    END;
+END;
+
+-- Trigger này xử lý việc thêm mới và cập nhật hóa đơn khi có thêm mới hoặc cập nhật đơn hàng trong order_details
+Create TRIGGER trg_ManageInvoiceOnOrderDetails
+ON order_details
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Tính toán tổng số tiền và tổng chi phí
+    ;WITH OrderSums AS (
+        SELECT 
+            od.order_id,
+            SUM(od.price * od.quantity) AS amount_sum,
+            SUM(od.quantity * p.cost) AS cost_sum
+        FROM 
+            order_details od
+        INNER JOIN 
+            product p ON od.product_id = p.product_id
+        INNER JOIN
+            orders o ON od.order_id = o.order_id
+        WHERE 
+            od.order_id IN (SELECT order_id FROM inserted)
+            AND o.status = 1 -- Chỉ chọn những đơn hàng có trạng thái là 1
+        GROUP BY 
+            od.order_id
+    )
+    -- Chèn hoặc cập nhật hóa đơn
+    MERGE invoices AS i
+    USING OrderSums AS os
+    ON i.order_id = os.order_id
+    WHEN MATCHED THEN
+        UPDATE SET
+            i.amount = os.amount_sum,
+            i.profit = os.amount_sum - os.cost_sum
+    WHEN NOT MATCHED THEN
+        INSERT (amount, invoice_date, order_id, profit)
+        VALUES (os.amount_sum, GETDATE(), os.order_id, os.amount_sum - os.cost_sum);
+END;
